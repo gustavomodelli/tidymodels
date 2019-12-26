@@ -1,0 +1,139 @@
+library(tidyverse)
+library(recipes)
+library(rsample)
+library(parsnip)
+library(yardstick)
+library(GGally) ##DataSet
+
+
+##Happy
+data(happy)
+
+##Remove NA outcome
+happy <- happy %>% 
+  filter(!is.na(happy))
+
+#Plots
+ggplot(happy, aes(happy, age, fill = happy))+
+  geom_boxplot()+
+  facet_wrap(~ sex)+
+  scale_fill_brewer(palette = 'Reds')
+
+ggplot(happy, aes(happy, fill = happy))+
+  geom_bar()
+
+ggplot(happy, aes(happy, fill = finrela))+
+  geom_bar(position = 'fill')
+
+ggplot(happy, aes(happy, fill = marital))+
+  geom_bar(position = 'fill')
+
+ggplot(happy, aes(happy, fill = sex))+
+  geom_bar(position = 'fill')
+
+ggplot(happy, aes(happy, fill = degree))+
+  geom_bar(position = 'fill')
+
+ggplot(happy, aes(happy, fill = health))+
+  geom_bar(position = 'fill')
+
+##By year
+happy.year <- happy %>% 
+  group_by(year, happy) %>% 
+  count() 
+
+ggplot(happy.year, aes(year, n))+
+  geom_line()+
+  facet_wrap(~ happy)
+
+# ----------------- Using glm ----------------------------------- #
+happy2 <- happy %>% 
+  mutate(
+    happy_bin = ifelse(happy == 'not too happy', 'no', 'yes'),
+    happy_bin = factor(happy_bin, levels = c('no','yes')),
+    happy_poi = ifelse(happy == 'not too happy', 0,
+                        ifelse(happy == 'pretty happy', 1, 2))
+  )
+
+model_01 <- glm(happy_bin ~ year + age + sex + marital + degree + finrela +
+                  health, data = happy2, family = 'binomial')
+summary(model_01)
+
+
+
+model_02 <- glm(happy_poi ~ year + age + sex + marital + degree + finrela +
+                  health, data = happy2, family = 'poisson')
+
+summary(model_02)
+
+#------------------- Recipe --------------------------------------#
+
+rec <- recipe(happy ~ . , data = happy) %>% 
+  step_rm(id, wtssall) %>% 
+  step_unknown(all_nominal(), -all_outcomes(),-sex, new_level = 'not_informed' ) %>% 
+  step_other(all_nominal(), -all_outcomes(), -sex, threshold = 0.01) %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>% 
+  step_medianimpute(age) %>% 
+  step_zv(all_predictors())
+
+preparo <- prep(rec, happy)
+happy.new <- bake(preparo, happy)
+
+
+#----------------- Using tidymodels -------------------------------#
+
+split <- initial_split(happy.new, prop = 0.75) 
+happy.train <- training(split)
+happy.test <- testing(split)
+
+
+# ---------------- Parsnip ----------------------------------------#
+
+model01 <- rand_forest(mode = 'classification', mtry = 6) %>% 
+  set_engine('ranger') %>% 
+  fit(happy ~ . , data = happy.train)
+
+result <- model01 %>%
+          predict(happy.test) %>% 
+          bind_cols(happy.test) 
+
+model01 %>% 
+  predict(happy.test) %>% 
+  bind_cols(happy.test) %>% 
+  metrics(truth = happy, estimate = .pred_class)
+
+
+# ----------------- Using H2o -------------------------------------#
+
+library(h2o)
+
+
+h2o.init(nthreads = -1)
+
+##------Load Data --------- #
+happy.h2o <- as.h2o(happy.new)
+
+## -------- Data Split -----#
+split <- h2o.splitFrame(happy.h2o, ratios = 0.75)
+happy.train <- split[[1]]
+happy.test <- split[[2]]
+
+## -------- Vars ----------- #
+x <- setdiff(names(happy.h2o), 'happy')
+y <- 'happy'
+
+happy.rf <- h2o.randomForest(x = x, y = y, training_frame = happy.train,
+                             nfolds = 5, balance_classes = TRUE)
+happy.rf
+h2o.performance(happy.rf, newdata = happy.test)
+h2o.varimp_plot(happy.rf)
+
+
+happy.glm <- h2o.glm(x = x, y= y, training_frame = happy.train,
+                     nfolds = 5, lambda_search = TRUE, family = 'multinomial',
+                     balance_classes = TRUE)
+happy.glm
+h2o.performance(happy.glm, newdata = happy.test)
+h2o.varimp_plot(happy.glm)
+
+h2o.shutdown()
