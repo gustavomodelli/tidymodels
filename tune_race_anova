@@ -1,0 +1,78 @@
+library(tidyverse)
+library(tidymodels)
+library(finetune)
+library(palmerpenguins)
+
+penguins <- palmerpenguins::penguins
+
+## we build a multimodel and test two different search strategy
+
+## Split data
+set.seed(123)
+split <- initial_split(penguins, strata = 'species')
+penguins_train <- training(split)
+penguins_test <- testing(split)
+
+## recipe 
+rec <- recipe(species ~ . , data = penguins_train) %>% 
+  step_rm(sex) %>% 
+  step_medianimpute(all_numeric()) %>% 
+  step_dummy(all_nominal(), -species) %>% 
+  step_zv(all_predictors()) 
+
+
+## model
+
+model_xgb <- boost_tree(mode = 'classification', mtry = tune(), min_n = tune(), tree_depth = tune(), learn_rate = tune()) %>% 
+  set_engine('xgboost')
+
+## workflow 
+
+work_xgb <- workflow() %>% 
+  add_recipe(rec) %>% 
+  add_model(model_xgb)
+
+## resamples
+
+folds <- bootstraps(penguins_train, times = 10)
+
+## tune 01 - normal with space filling grid 20
+
+start_time = Sys.time()
+tune_xgb_01 <- tune_grid(
+  work_xgb,
+  resamples = folds,
+  grid = 20,
+  metrics = metric_set(roc_auc, bal_accuracy),
+  control = control_grid(verbose = TRUE, parallel_over = 'resamples')
+)
+end_time = Sys.time()
+
+## race Anova
+start_time = Sys.time()
+tune_xgb_02 <- tune_race_anova(
+  work_xgb, 
+  resamples = folds,
+  grid = 20,
+  metrics = metric_set(roc_auc, bal_accuracy),
+  control = control_race(verbose_elim = TRUE)
+)
+end_time = Sys.time()
+
+##showbest
+show_best(tune_xgb_01)
+best_xgb <- select_best(tune_xgb_01)
+show_best(tune_xgb_02)
+
+autoplot(tune_xgb_01)
+autoplot(tune_xgb_02)
+
+##model test
+test01 <- work_xgb %>% 
+  finalize_workflow(best_xgb) %>% 
+  last_fit(split)
+
+test01 %>% collect_metrics()
+
+test01 %>% collect_predictions() %>% 
+  conf_mat(truth = species, estimate = .pred_class)
