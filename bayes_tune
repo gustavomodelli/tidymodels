@@ -1,0 +1,276 @@
+library(tidyverse)
+library(tidymodels)
+library(vip)
+library(rattle)
+library(modeltime)
+library(lubridate)
+library(timetk)
+library(GGally)
+library(themis)
+library(embed)
+
+##data
+weather <- rattle::weatherAUS
+weather %>% str()
+
+##filter NA target
+weather <- weather %>% filter(!is.na(RainTomorrow))
+
+##Percent NA
+weather %>% 
+  map(~ sum(is.na(.))/length(.) )
+
+weather %>% 
+  mutate(Location = fct_lump_prop(Location, prop = 0.022)) %>% 
+  group_by(Location) %>% 
+  count(RainTomorrow) %>% 
+  ggplot(aes(reorder(Location, n), n, fill = RainTomorrow))+
+  geom_col()+
+  coord_flip()
+
+##Outcome
+weather %>% 
+  group_by(RainTomorrow) %>% 
+  count() %>% 
+  ggplot(aes(RainTomorrow, n, fill = RainTomorrow))+
+  geom_col()+
+  geom_label(aes(label = n))
+
+##By month
+weather %>% 
+  mutate(Month = month(Date, label = TRUE)) %>% 
+  group_by(Month) %>% 
+  count(RainTomorrow) %>% 
+  ggplot(aes(RainTomorrow, n, fill = RainTomorrow))+
+  geom_col()+
+  facet_wrap(~ Month)
+
+##By Humidity
+ggplot(weather, aes(RainTomorrow, Humidity3pm, fill = RainTomorrow))+
+  geom_boxplot()
+
+##principal vars
+to_pairs <- weather %>% select(Humidity9am,Humidity3pm, Rainfall, 
+                               Pressure9am, Pressure3pm, MinTemp,
+                               RainTomorrow)
+ggpairs(to_pairs, aes(color = RainTomorrow))
+
+##First Model
+
+##split
+
+set.seed(123)
+split <- initial_split(weather, strata = 'RainTomorrow')
+weather_train <- training(split)
+weather_test <- testing(split)
+
+##Recipe
+rec_lasso <- recipe(RainTomorrow ~ . , data = weather_train) %>% 
+  step_rm(Evaporation, Sunshine, Cloud9am, Cloud3pm,
+           RISK_MM, Location, Date ) %>% ##Drop > 40% missing
+  step_unknown(RainToday, contains('WindDir'), WindGustDir) %>%
+  step_lencode_glm(
+    contains('WindDir'), WindGustDir, 
+    outcome = 'RainTomorrow'
+  ) %>% 
+  step_medianimpute(all_numeric()) %>% 
+  step_YeoJohnson(all_numeric()) %>% 
+  step_normalize(all_numeric()) %>% 
+  step_dummy(all_nominal(), -RainTomorrow) %>% 
+  step_zv(all_predictors()) %>% 
+  step_downsample(RainTomorrow)
+
+
+rec_tree <- recipe(RainTomorrow ~ . , data = weather_train) %>% 
+  step_rm(Evaporation, Sunshine, Cloud9am, Cloud3pm,
+          RISK_MM, Location, Date ) %>% ##Drop > 40% missing
+  step_unknown(RainToday, contains('WindDir'), WindGustDir) %>%
+  step_lencode_glm(
+    contains('WindDir'), WindGustDir, 
+    outcome = 'RainTomorrow'
+  ) %>%  
+  step_medianimpute(all_numeric()) %>% 
+  step_dummy(all_nominal(), -RainTomorrow, one_hot = TRUE) %>% 
+  step_zv(all_predictors()) %>% 
+  step_downsample(RainTomorrow)
+
+## model
+
+model_lasso <- logistic_reg(penalty = tune(), mixture = tune()) %>% 
+  set_engine('glmnet')
+
+model_xgb <- boost_tree(mode = 'classification', mtry = tune(), min_n = tune(), tree_depth = tune(), learn_rate = tune()) %>% 
+  set_engine('xgboost')
+
+## workflow
+
+work_lasso <- workflow() %>% 
+  add_recipe(rec_lasso) %>% 
+  add_model(model_lasso)
+
+work_xgb <- workflow() %>% 
+  add_recipe(rec_tree) %>% 
+  add_model(model_xgb)
+
+
+## folds
+
+folds <- vfold_cv(weather_train, strata = 'RainTomorrow', v = 5)
+
+## Tune
+tune_lasso <- tune_grid(
+  work_lasso,
+  resamples = folds,
+  grid = 15,
+  metrics = metric_set(roc_auc, bal_accuracy),
+  control = control_grid(verbose = TRUE, parallel_over = 'resamples',
+                         allow_par = TRUE)
+)
+
+autoplot(tune_lasso)
+
+tune_xgb <- tune_grid(
+  work_xgb,
+  resamples = folds,
+  grid = 20,
+  metrics = metric_set(roc_auc, bal_accuracy),
+  control = control_grid(verbose = TRUE, parallel_over = 'resamples',
+                         allow_par = TRUE)
+)
+
+
+res_xgb <- fit_resamples(
+  work_xgb,
+  resamples = folds,
+  metrics = metric_set(roc_auc, bal_accuracy),
+  control = control_grid(verbose = TRUE, parallel_over = 'resamples',
+                         allow_par = TRUE)
+)
+
+
+res_param <- parameters(work_xgb) %>% 
+  update(mtry = mtry(range = c(10L, 20L) ))
+
+tune_xgb_bayes <- tune_bayes(
+  work_xgb,
+  resamples = folds,
+  metrics = metric_set(roc_auc, bal_accuracy),
+  initial = 5,
+  param_info = res_param,
+  iter = 10,
+  control = control_bayes(verbose = TRUE, parallel_over = 'resamples')
+)
+
+
+
+  ##Show best
+show_best(tune_lasso, metric = 'bal_accuracy')
+show_best(tune_lasso, metric = 'roc_auc')
+best_lasso <- select_best(tune_lasso, metric = 'roc_auc')
+
+show_best(res_xgb)
+show_best(tune_xgb)
+best_xgb <- select_best(tune_xgb_bayes)
+show_best(tune_xgb_bayes)
+
+##test
+test_lasso <- work_lasso %>% 
+  finalize_workflow(best_lasso) %>% 
+  last_fit(split)
+
+test_lasso %>% collect_metrics()
+
+test_lasso  %>%  collect_predictions() %>% 
+  conf_mat(truth = RainTomorrow, estimate = .pred_class)
+
+
+test_xgb <- work_xgb %>% 
+  finalize_workflow(best_xgb) %>% 
+  last_fit(split)
+
+test_xgb %>% collect_metrics()
+
+test_xgb  %>%  collect_predictions() %>% 
+  conf_mat(truth = RainTomorrow, estimate = .pred_class)
+
+
+## model final
+final_lasso <- work_lasso %>% 
+  finalize_workflow(best_lasso) %>% 
+  fit(weather_train)
+
+final_lasso %>% pull_workflow_fit() %>% vip(num_features = 20)
+
+
+
+## model final
+final_xgb <- work_xgb %>% 
+  finalize_workflow(best_xgb) %>% 
+  fit(weather_train)
+
+final_xgb %>% pull_workflow_fit() %>% vip(num_features = 20)
+
+
+##plot principal vars with two components
+rec_princ <- recipe(RainTomorrow ~ Humidity3pm + Pressure3pm +
+                      Rainfall + Pressure9am + Humidity9am + MaxTemp +
+                      Temp3pm + Temp9am + MinTemp + WindSpeed3pm, 
+                    data = weather) %>% 
+  step_medianimpute(all_numeric()) %>% 
+  step_YeoJohnson(all_numeric()) %>% 
+  step_normalize(all_numeric()) %>% 
+  step_pca(all_predictors())
+
+new <- rec_princ %>% prep() %>% juice()
+
+ggplot(new, aes(PC1, PC2, fill = RainTomorrow))+
+  geom_point(alpha = 0.5)
+
+##Using viz
+library(factoextra)
+
+rec_princ2 <- recipe( ~ Humidity3pm + Pressure3pm +
+                      Rainfall + Pressure9am + Humidity9am + MaxTemp +
+                      Temp3pm + Temp9am + MinTemp + WindSpeed3pm, 
+                    data = weather) %>% 
+  step_medianimpute(all_numeric()) %>% 
+  step_YeoJohnson(all_numeric()) %>% 
+  step_normalize(all_numeric()) 
+
+res_matrix <- rec_princ2 %>% prep() %>% juice(composition = 'matrix')
+res_pca <- prcomp(res_matrix)
+
+
+fviz_pca(res_pca)
+
+
+##Time series
+##restricat data to 2019-2020
+weather_low <- weather %>% 
+  mutate(year = year(Date)) %>% 
+  filter(year >= 2019)
+
+plot_time_series(.data = weather_low, .date_var = Date, .value = RISK_MM)
+
+plot_seasonal_diagnostics(.data = weather_low, .date_var = Date, .value = RISK_MM)
+
+
+##time series
+split <- initial_time_split(weather_low)
+weather_low_train <- training(split)
+weather_low_test <- testing(split)
+
+## arima
+##Arima model
+model_arima <- arima_reg() %>% 
+  set_engine('auto_arima') %>% 
+  fit(RISK_MM ~ Date, data = weather_low_train)
+
+#Plot
+model_tbs <- modeltime_table(model_arima)
+
+##Calibrare
+model_calibrate <- modeltime_calibrate(model_tbs, new_data = weather_low_test)
+
+##Accuray
+model_calibrate %>% modeltime_accuracy()
